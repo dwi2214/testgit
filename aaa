@@ -1,0 +1,338 @@
+import os
+import pynetbox
+import ipaddress
+import datetime
+#import math
+from prometheus_api_client import PrometheusConnect
+from extras.scripts import *
+
+class DiscoverVMHyperV(Script):
+    class Meta:
+        name = "Discover VM Hyper-V"
+        description = "Choose hyper-v host that need to be discovered"
+        field_order = ['input_data']
+
+    CHOICES = (
+        ('KS-HPV-04','KS-HPV-04'),
+        ('KS-HPV-00','ks')
+    )
+
+    input_data = ChoiceVar(
+        choices=CHOICES,
+        description="Choose Subnet"
+    )
+
+    def run(self, data, commit):
+
+        # List of CIDR blocks to scan
+        #cidr_blocks = [data['input_data']]
+        log_file = '/tmp/cobakak.txt'
+        prom = PrometheusConnect(url = "https://prometheus.kaskusnetworks.com", disable_ssl=False)
+        nb = pynetbox.api(os.getenv('NETBOX_AUTOMATION_URL'), token=os.getenv('NETBOX_AUTOMATION_TOKEN'))
+
+        ### HYPER-V VM
+
+        class DuplicateFoundError(Exception):
+            pass
+
+        print("### START DISCOVERY HYPER-V VM ###")
+
+        output_mapping_state_vm = {
+            "Running": "active",
+            "Off": "offline"
+        }
+
+        datelog = datetime.datetime.now()
+###
+        # Before Running makesure no duplicate VMs on Netbox
+
+        netbox_vm_all_cluster = []
+        get_netbox_active_vm_all_cluster = nb.virtualization.virtual_machines.filter()
+        for b in get_netbox_active_vm_all_cluster:
+            netbox_vm_all_cluster.append(b.name)
+
+        find_netbox_vm = set([x for x in netbox_vm_all_cluster if netbox_vm_all_cluster.count(x) > 1])
+
+        if find_netbox_vm:
+            print("Found Duplicate VMs on Netbox: ", find_netbox_vm)
+            raise DuplicateFoundError("Duplicates found: " + str(find_netbox_vm))
+        else:
+            print("No Duplicate VMs on Netbox")
+
+        my_label_config = {'hostname': 'KS-HPV-04'}
+
+        get_prom_powershell_exporter_vm_name = prom.get_current_metric_value(metric_name='CPURAM', label_config=my_label_config)
+
+        prometheus_vm_powershell_exporter = []
+        for item in get_prom_powershell_exporter_vm_name:
+            prometheus_vm_powershell_exporter.append(item['metric']['vm'])
+        output_list_powershell_exporter_vm = [a.split(':')[0] for a in prometheus_vm_powershell_exporter]
+
+        # Before Running makesure no duplicate VMs on Prometheus
+        find_prom_powershell_vm_duplicate = set([x for x in output_list_powershell_exporter_vm if output_list_powershell_exporter_vm.count(x) > 1])
+
+        if find_prom_powershell_vm_duplicate:
+            print("Found Duplicate VMs on Prometheus: ", find_prom_powershell_vm_duplicate)
+            raise DuplicateFoundError("Duplicates found: " + str(find_prom_powershell_vm_duplicate))
+        else:
+            print("No Duplicate VMs on Prometheus")
+
+        netbox_vm = []
+        get_netbox_active_vm = nb.virtualization.virtual_machines.filter(cluster_group_id=1)
+        for b in get_netbox_active_vm:
+            netbox_vm.append(b.name)
+        self.log_info(netbox_vm)
+
+        get_vm_not_in_netbox = [item for item in output_list_powershell_exporter_vm if item not in netbox_vm]
+        get_vm_not_in_prometheus = [item for item in netbox_vm if item not in output_list_powershell_exporter_vm]
+
+        # IF EXIST ON NETBOX, BUT NOT EXIST ON PROMETHEUS
+        get_prom_powershell_exporter_hostname_hpv = prom.get_current_metric_value(metric_name='sum(CPURAM) by (hostname)')
+        prometheus_hostname_hpv_powershell_exporter = []
+        for hpv_hostname in get_prom_powershell_exporter_hostname_hpv:
+            prometheus_hostname_hpv_powershell_exporter.append(hpv_hostname['metric']['hostname'])
+        output_list_hostname_hpv = [a.split(':')[0] for a in prometheus_hostname_hpv_powershell_exporter]
+
+        #hyperv_hostname = ['KS-HPV-01', 'KS-HPV-02', 'KS-HPV-03', 'KS-HPV-04', 'KS-HPV-05', 'KS-HPV-06', 'KS-HPV-07', 'KS-HPV-08', 'KS-HPV-09', 'KS-HPV-10', 'KS-HPV-STAG1', 'KS-HPV-STAG2', 'KS-HPV-STAG3', 'KS-HPV-STAG4', 'KS-HPV-STAG5']
+        #hyperv_hostname = ['KS-HPV-04']
+        hyperv_hostname = [data['input_data']]
+
+        vm_prom_lists = []
+        for hostname in hyperv_hostname:
+            prometheus_hostname_hpv_powershell_exporter = []
+            get_prom_powershell_exporter_vm_from_hostname_hpv = prom.get_current_metric_value(metric_name=f'CPURAM{{hostname="{hostname}"}}')
+            if len(get_prom_powershell_exporter_vm_from_hostname_hpv) != 0:
+                for hpv_hostname in get_prom_powershell_exporter_vm_from_hostname_hpv:
+                    prometheus_hostname_hpv_powershell_exporter.append(hpv_hostname['metric']['vm'])
+                output_list_hostname_hpv_update = [a.split(':')[0] for a in prometheus_hostname_hpv_powershell_exporter]
+                vm_prom_lists.append(output_list_hostname_hpv_update)
+            else:
+                vm_prom_lists.append("BUGSKIP")
+
+        if any("BUGSKIP" in lst for lst in vm_prom_lists):
+            print("SKIP DELETING DUE BUGS POWERSHELL EXPORTER - " + str(datelog))
+        else:
+            get_vm_not_in_prometheus = [item for item in netbox_vm if item not in [inner_item for inner_list in vm_prom_lists for inner_item in inner_list]]
+            for vm_not_in_prometheus in get_vm_not_in_prometheus:
+                print("Delete VM - " + str(vm_not_in_prometheus) + " - " + str(datelog))
+                delete_vm_in_netbox = nb.virtualization.virtual_machines.get(name=vm_not_in_prometheus).delete()
+
+
+        ## IF EXIST ON PROMETHEUS, BUT NOT EXIST ON NETBOX
+        for vm_not_in_netbox in get_vm_not_in_netbox:
+            print("Creating vm " + str(vm_not_in_netbox) + " on netbox" + " - " + str(datelog))
+
+            get_vm_cluster_powershell = prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(vm_not_in_netbox) + '"}')[0]['metric']['hostname'] + ".kaskus.local"
+            get_vm_cpu_powershell = prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(vm_not_in_netbox) + '"}')[0]['metric']['cpu']
+            get_vm_memory_powershell = round(float(prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(vm_not_in_netbox) + '"}')[0]['metric']['ram'])/ (1024 * 1024), 0)
+            get_vm_state_powershell = output_mapping_state_vm.get((str(prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(vm_not_in_netbox) + '"}')[0]['metric']['state'])),"UNKNW")
+
+            get_vm_disk_list = prom.get_current_metric_value(metric_name='DiskPerVM{vm="' + str(vm_not_in_netbox) + '"}' )
+            get_disk_per_vm_list = [int(item['metric']['ProvisionedGB']) for item in get_vm_disk_list]
+            get_vm_total_disk_powershell = sum(get_disk_per_vm_list)
+
+            self.log_info(vm_not_in_netbox)
+            create_vm_in_netbox = nb.virtualization.virtual_machines.create(
+                {
+                    "name": vm_not_in_netbox,
+                    "site":
+                        {
+                        "name" : "IDC 3D"
+                        },
+                    "cluster" :
+                        {
+                        "name" : get_vm_cluster_powershell
+                        },
+                    "status" : get_vm_state_powershell,
+                    "vcpus" : str(get_vm_cpu_powershell),
+                    "memory" : str(get_vm_memory_powershell),
+                    "disk" : str(get_vm_total_disk_powershell),
+                }
+            )
+
+
+        # COMPARE VALUE BETWEEN NETBOX AND PROMETHEUS
+        for get_netbox_in_vm in output_list_powershell_exporter_vm:
+            print("Compare Value " + str(get_netbox_in_vm) + " - " + str(datelog) )
+
+            ## CLUSTER
+            get_vm_cluster_netbox = str(nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).cluster)
+            try:
+                get_vm_cluster_powershell = str(prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(get_netbox_in_vm) + '"}')[0]['metric']['hostname']) + ".kaskus.local"
+            except IndexError:
+                get_vm_cluster_powershell = []
+
+            ## STATE
+            get_vm_state_netbox = str(nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).status).lower()
+            try:
+                get_vm_state_powershell = output_mapping_state_vm.get((str(prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(get_netbox_in_vm) + '"}')[0]['metric']['state'])),"UNKNW")
+            except IndexError:
+                get_vm_state_powershell = []
+
+            ## CPU
+            get_vm_cpu_netbox = str(int(nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).vcpus))
+            try:
+                get_vm_cpu_powershell = prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(get_netbox_in_vm) + '"}')[0]['metric']['cpu']
+            except IndexError:
+                get_vm_cpu_powershell = []
+
+            ## RAM
+            get_vm_memory_netbox = str(nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).memory)
+            try:
+                get_vm_memory_powershell = str(int(round(float(prom.get_current_metric_value(metric_name='CPURAM{vm="' + str(get_netbox_in_vm) + '"}')[0]['metric']['ram'])/ (1024 * 1024), 0)))
+            except:
+                get_vm_memory_powershell = []
+
+            ## Disk
+            get_vm_disk_netbox = str(nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).disk)
+            try:
+                get_vm_disk_list = prom.get_current_metric_value(metric_name='DiskPerVM{vm="' + str(get_netbox_in_vm) + '"}' )
+            except IndexError:
+                get_vm_disk_list = []
+            get_disk_per_vm_list = [int(item['metric']['ProvisionedGB']) for item in get_vm_disk_list]
+            get_vm_total_disk_powershell = str(sum(get_disk_per_vm_list))
+
+                ## NetworkIP
+            get_netbox_prefix = list(nb.ipam.prefixes.filter())
+            netbox_prefix = []
+            for pref in get_netbox_prefix:
+                netbox_prefix.append(str(pref))
+            #print(netbox_prefix) ['172.25.54.2', '172.25.54.3']
+
+            def get_most_specific_subnet(ip_address):
+                a = ipaddress.ip_address(ip_address)
+                most_specific_subnet = None
+
+                for p in netbox_prefix:
+                    if a in ipaddress.ip_network(p):
+                        if most_specific_subnet is None or ipaddress.ip_network(p) > ipaddress.ip_network(most_specific_subnet):
+                            most_specific_subnet = p
+
+                if most_specific_subnet is not None:
+                    return str(a) + '/' + str(ipaddress.ip_network(most_specific_subnet).prefixlen)
+                else:
+                    return "notsubnet"
+
+            get_vm_count_mac_list = prom.get_current_metric_value(metric_name='NetMacIP{vm="' + str(get_netbox_in_vm) + '"}' )
+            create_list_get_vm_mac = [str(item['metric']['macadd']) for item in get_vm_count_mac_list]
+            list_range_vm_mac = list(range(0, len(create_list_get_vm_mac)+0))
+            #[0, 1]
+
+            for macvm,ethnumber in zip(create_list_get_vm_mac, list_range_vm_mac):
+
+                check_vm_id = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).id
+                inventory_items_object_powersupply = []
+                check_interfaces_vm = [str(j) for j in nb.virtualization.interfaces.filter(virtual_machine_id=check_vm_id)]
+
+                if ("eth"+str(ethnumber)) in check_interfaces_vm:
+                    pass
+                else:
+                    print("Create Interface VM " + ("eth"+str(ethnumber)) + " on " + str(get_netbox_in_vm))
+                    create_vm_interface = nb.virtualization.interfaces.create (
+                            {
+                                "name": "eth"+str(ethnumber),
+                                "mac_address": macvm,
+                                "virtual_machine": {
+                                    "id":  check_vm_id
+                                }
+                            }
+                        )
+
+                ## Get from description override value
+                get_existing_ip_interface_netbox = nb.virtualization.interfaces.get(virtual_machine_id=check_vm_id,name=("eth"+str(ethnumber))).description
+
+                ## If from description is 0
+
+                if len(get_existing_ip_interface_netbox) == 0:
+                    try:
+                        get_vm_ip_powershell = get_most_specific_subnet(prom.get_current_metric_value(metric_name='NetMacIP{vm="' + str(get_netbox_in_vm) + '",macadd="' + str(macvm) + '"}' )[0]['metric']['ipadd'].split(";")[0])
+                        print(get_vm_ip_powershell)
+
+                        if get_vm_ip_powershell is None or "fe80" in get_vm_ip_powershell or "notsubnet" in get_vm_ip_powershell:
+                            pass
+
+                        else:
+                            get_ip_address_netbox = nb.ipam.ip_addresses.get(address=get_vm_ip_powershell)
+
+                            if get_ip_address_netbox is None:
+                                print("Create IP " + str(get_vm_ip_powershell))
+                                create_ip_if_not_exist_on_netbox = nb.ipam.ip_addresses.create(address=get_vm_ip_powershell)
+
+                            get_ip_interface_netbox_id = nb.virtualization.interfaces.get(virtual_machine_id=check_vm_id,name=("eth"+str(ethnumber))).id
+
+                            print("Update interface VM " + str(get_netbox_in_vm) + (" eth"+str(ethnumber)) + " with IP " + str(get_vm_ip_powershell))
+                            update_vm_interface_ip_netbox = nb.ipam.ip_addresses.get(address=get_vm_ip_powershell).update(
+                                            {
+                                            "assigned_object_type": "virtualization.vminterface",
+                                            "assigned_object_id": get_ip_interface_netbox_id
+                                            }
+                                        )
+
+                    except KeyError:
+                        get_vm_ip_powershell = ""
+                        print("Interface VM " + str(get_netbox_in_vm) + (" eth"+str(ethnumber)) + " with no IP ")
+
+                ## If description has value
+                else:
+
+                    ### Check if IP existing, if none, create
+                    check_if_ip_exist = nb.ipam.ip_addresses.get(address=get_existing_ip_interface_netbox)
+                    if check_if_ip_exist is None:
+                        print("Create IP " + str(check_if_ip_exist) + "based on via description")
+                        create_ip_if_not_exist_on_netbox = nb.ipam.ip_addresses.create(address=get_existing_ip_interface_netbox)
+
+                    ## Get id interface eth, for update
+                    get_ip_interface_netbox_id2 = nb.virtualization.interfaces.get(virtual_machine_id=check_vm_id,name=("eth"+str(ethnumber))).id
+
+                    ## Update using description
+                    print("Update interface VM " + str(get_netbox_in_vm) + (" eth"+str(ethnumber)) + " with IP " + str(get_existing_ip_interface_netbox) + " based on description")
+                    update_vm_interface_ip_netbox2 = nb.ipam.ip_addresses.get(address=get_existing_ip_interface_netbox).update(
+                                    {
+                                    "assigned_object_type": "virtualization.vminterface",
+                                    "assigned_object_id": get_ip_interface_netbox_id2
+                                    }
+                                )
+
+            ## IF != UPDATE USING VALUE FROM PROMETHEUS
+
+            if get_vm_cluster_netbox != get_vm_cluster_powershell and len(get_vm_cluster_powershell) != 0:
+                print("Update Value VM Cluster - " + str(get_netbox_in_vm) + " - " + str(datelog) )
+                update_vm_cluster_netbox = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).update(
+                    {
+                        "cluster": {
+                            "name": get_vm_cluster_powershell
+                            }
+                    }
+                )
+
+            if get_vm_state_netbox != get_vm_state_powershell and len(get_vm_state_powershell) != 0:
+                print("Update Value VM Status - " + str(get_netbox_in_vm) + " - " + str(datelog) )
+                update_vm_state_netbox = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).update(
+                    {
+                        "status": get_vm_state_powershell
+                    }
+                )
+
+            if get_vm_cpu_netbox != get_vm_cpu_powershell and len(get_vm_cpu_powershell) != 0:
+                print("Update Value VM CPU - " + str(get_netbox_in_vm) + " - " + str(datelog) )
+                update_vm_cpu_netbox = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).update(
+                    {
+                        "vcpus": get_vm_cpu_powershell
+                    }
+                )
+
+            if get_vm_memory_netbox != get_vm_memory_powershell and len(get_vm_memory_powershell) != 0:
+                print("Update Value VM Memory - " + str(get_netbox_in_vm) + " - " + str(datelog) )
+                update_vm_memory_netbox = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).update(
+                    {
+                        "memory": get_vm_memory_powershell
+                    }
+                )
+
+            if get_vm_disk_netbox != get_vm_total_disk_powershell and len(get_vm_disk_list) != 0:
+                print("Update Value VM Disk - " + str(get_netbox_in_vm) + " - " + str(datelog) )
+                update_vm_disk_netbox = nb.virtualization.virtual_machines.get(name=get_netbox_in_vm).update(
+                    {
+                        "disk": get_vm_total_disk_powershell
+                    }
+                )
